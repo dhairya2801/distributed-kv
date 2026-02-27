@@ -1,4 +1,4 @@
-package main
+package engine
 
 import (
 	"bytes"
@@ -16,11 +16,24 @@ import (
 
 const (
 	// MemTable is flushed to L0 when it reaches this size.
-	defaultMemTableLimit int64 = 4 << 20 // 4 MiB
+	DefaultMemTableLimit int64 = 4 << 20 // 4 MiB
 
 	// When L0 has this many SSTables, a compaction into L1 is triggered.
-	defaultL0CompactionThreshold = 4
+	DefaultL0CompactionThreshold = 4
 )
+
+// Option configures an LSMTree at open time.
+type Option func(*LSMTree)
+
+// WithMemTableLimit sets the MemTable flush threshold in bytes.
+func WithMemTableLimit(n int64) Option {
+	return func(t *LSMTree) { t.memTableLimit = n }
+}
+
+// WithL0CompactionThreshold sets how many L0 SSTables trigger compaction.
+func WithL0CompactionThreshold(n int) Option {
+	return func(t *LSMTree) { t.l0CompactionThreshold = n }
+}
 
 // ──────────────────────────────────────────────────────────────
 //  LSMTree
@@ -35,11 +48,11 @@ type LSMTree struct {
 	dir     string // directory for SSTable and WAL files
 	walPath string
 
-	mu        sync.RWMutex   // protects memTable, imm, levels
-	memTable  *SkipList      // active (mutable) MemTable
-	imm       *SkipList      // immutable MemTable being flushed (nil when idle)
-	wal       *WAL           // WAL for the active MemTable
-	levels    [][]*SSTableReader // levels[0] = L0, levels[1] = L1, …
+	mu       sync.RWMutex      // protects memTable, imm, levels
+	memTable *SkipList         // active (mutable) MemTable
+	imm      *SkipList         // immutable MemTable being flushed (nil when idle)
+	wal      *WAL              // WAL for the active MemTable
+	levels   [][]*SSTableReader // levels[0] = L0, levels[1] = L1, …
 
 	nextSST   atomic.Int64   // monotonic counter for SSTable filenames
 	flushCh   chan struct{}   // signals the background flusher
@@ -47,13 +60,76 @@ type LSMTree struct {
 	closeCh   chan struct{}   // closed to signal shutdown
 	wg        sync.WaitGroup // tracks background goroutines
 
-	memTableLimit        int64
+	memTableLimit         int64
 	l0CompactionThreshold int
+
+	observer Observer // nil by default
+}
+
+// SetObserver registers an observer that will receive events. Pass nil to
+// disable observation. Not goroutine-safe — call before starting operations.
+func (t *LSMTree) SetObserver(o Observer) {
+	t.observer = o
+}
+
+// emit sends an event to the observer if one is registered.
+func (t *LSMTree) emit(e Event) {
+	if t.observer != nil {
+		t.observer.OnEvent(e)
+	}
+}
+
+// statsLocked returns a Stats snapshot. Caller must hold t.mu (read or write).
+func (t *LSMTree) statsLocked() Stats {
+	s := Stats{
+		MemTableSize:     t.memTable.SizeBytes(),
+		MemTableCapacity: t.memTableLimit,
+		MemTableEntries:  t.memTable.Len(),
+		L0Threshold:      t.l0CompactionThreshold,
+		WALEntries:       t.wal.EntryCount(),
+	}
+	if t.imm != nil {
+		s.ImmEntries = t.imm.Len()
+	}
+	if len(t.levels) > 0 {
+		s.L0Count = len(t.levels[0])
+	}
+	if len(t.levels) > 1 {
+		s.L1Count = len(t.levels[1])
+	}
+	return s
+}
+
+// ForceFlush triggers an immediate flush of the active MemTable regardless
+// of its size. Blocks until the flush completes.
+func (t *LSMTree) ForceFlush() error {
+	t.mu.Lock()
+	if t.memTable.Len() == 0 {
+		t.mu.Unlock()
+		return nil
+	}
+	// Rotate: current MemTable becomes immutable; create a fresh one.
+	t.imm = t.memTable
+	t.memTable = NewSkipList()
+
+	t.emit(Event{Type: EventFlushBegin, Stats: t.statsLocked()})
+
+	if err := t.wal.Reset(); err != nil {
+		t.memTable = t.imm
+		t.imm = nil
+		t.mu.Unlock()
+		return fmt.Errorf("lsm: force flush wal reset: %w", err)
+	}
+
+	t.emit(Event{Type: EventWALReset, Stats: t.statsLocked()})
+	t.mu.Unlock()
+
+	return t.flushMemTable()
 }
 
 // OpenLSMTree opens (or creates) an LSM tree rooted at dir. It recovers
 // any entries from the WAL into the MemTable, and re-opens existing SSTables.
-func OpenLSMTree(dir string) (*LSMTree, error) {
+func OpenLSMTree(dir string, opts ...Option) (*LSMTree, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("lsm: mkdir %q: %w", dir, err)
 	}
@@ -73,8 +149,12 @@ func OpenLSMTree(dir string) (*LSMTree, error) {
 		flushCh:               make(chan struct{}, 1),
 		compactCh:             make(chan struct{}, 1),
 		closeCh:               make(chan struct{}),
-		memTableLimit:         defaultMemTableLimit,
-		l0CompactionThreshold: defaultL0CompactionThreshold,
+		memTableLimit:         DefaultMemTableLimit,
+		l0CompactionThreshold: DefaultL0CompactionThreshold,
+	}
+
+	for _, opt := range opts {
+		opt(tree)
 	}
 
 	// Recover WAL entries into the MemTable.
@@ -109,7 +189,11 @@ func (t *LSMTree) Put(key, value []byte) error {
 	if err := t.wal.Write(OpPut, key, value); err != nil {
 		return fmt.Errorf("lsm put: wal write: %w", err)
 	}
+	t.emit(Event{Type: EventWALWrite, Key: key, Value: value, Stats: t.statsLocked()})
+
 	t.memTable.Put(key, value)
+	t.emit(Event{Type: EventMemTableInsert, Key: key, Value: value, Stats: t.statsLocked()})
+
 	t.maybeScheduleFlush()
 	return nil
 }
@@ -122,7 +206,11 @@ func (t *LSMTree) Delete(key []byte) error {
 	if err := t.wal.Write(OpDelete, key, nil); err != nil {
 		return fmt.Errorf("lsm delete: wal write: %w", err)
 	}
+	t.emit(Event{Type: EventWALWrite, Key: key, Deleted: true, Stats: t.statsLocked()})
+
 	t.memTable.Delete(key)
+	t.emit(Event{Type: EventMemTableDelete, Key: key, Deleted: true, Stats: t.statsLocked()})
+
 	t.maybeScheduleFlush()
 	return nil
 }
@@ -133,22 +221,32 @@ func (t *LSMTree) Get(key []byte) ([]byte, bool, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
+	t.emit(Event{Type: EventGetBegin, Key: key, Stats: t.statsLocked()})
+
 	// 1. Active MemTable.
 	if val, found := t.memTable.Get(key); found {
+		t.emit(Event{Type: EventGetMemTable, Key: key, Value: val, Found: true, Stats: t.statsLocked()})
 		if val == nil {
+			t.emit(Event{Type: EventGetResult, Key: key, Found: false, Deleted: true, Stats: t.statsLocked()})
 			return nil, false, nil // tombstone
 		}
+		t.emit(Event{Type: EventGetResult, Key: key, Value: val, Found: true, Stats: t.statsLocked()})
 		return val, true, nil
 	}
+	t.emit(Event{Type: EventGetMemTable, Key: key, Found: false, Stats: t.statsLocked()})
 
 	// 2. Immutable MemTable (being flushed).
 	if t.imm != nil {
 		if val, found := t.imm.Get(key); found {
+			t.emit(Event{Type: EventGetImm, Key: key, Value: val, Found: true, Stats: t.statsLocked()})
 			if val == nil {
+				t.emit(Event{Type: EventGetResult, Key: key, Found: false, Deleted: true, Stats: t.statsLocked()})
 				return nil, false, nil
 			}
+			t.emit(Event{Type: EventGetResult, Key: key, Value: val, Found: true, Stats: t.statsLocked()})
 			return val, true, nil
 		}
+		t.emit(Event{Type: EventGetImm, Key: key, Found: false, Stats: t.statsLocked()})
 	}
 
 	// 3. L0 SSTables — newest first (end of slice = newest).
@@ -157,10 +255,13 @@ func (t *LSMTree) Get(key []byte) ([]byte, bool, error) {
 		if err != nil {
 			return nil, false, fmt.Errorf("lsm get L0[%d]: %w", i, err)
 		}
+		t.emit(Event{Type: EventGetL0, Key: key, Found: found, SSTPath: t.levels[0][i].Path(), Level: 0, Stats: t.statsLocked()})
 		if found {
 			if deleted {
+				t.emit(Event{Type: EventGetResult, Key: key, Found: false, Deleted: true, Stats: t.statsLocked()})
 				return nil, false, nil
 			}
+			t.emit(Event{Type: EventGetResult, Key: key, Value: val, Found: true, Stats: t.statsLocked()})
 			return val, true, nil
 		}
 	}
@@ -172,15 +273,19 @@ func (t *LSMTree) Get(key []byte) ([]byte, bool, error) {
 			if err != nil {
 				return nil, false, fmt.Errorf("lsm get L%d[%d]: %w", lvl, i, err)
 			}
+			t.emit(Event{Type: EventGetL1, Key: key, Found: found, SSTPath: t.levels[lvl][i].Path(), Level: lvl, Stats: t.statsLocked()})
 			if found {
 				if deleted {
+					t.emit(Event{Type: EventGetResult, Key: key, Found: false, Deleted: true, Stats: t.statsLocked()})
 					return nil, false, nil
 				}
+				t.emit(Event{Type: EventGetResult, Key: key, Value: val, Found: true, Stats: t.statsLocked()})
 				return val, true, nil
 			}
 		}
 	}
 
+	t.emit(Event{Type: EventGetResult, Key: key, Found: false, Stats: t.statsLocked()})
 	return nil, false, nil
 }
 
@@ -322,6 +427,9 @@ func (t *LSMTree) flushLoop() {
 			// Rotate: current MemTable becomes immutable; create a fresh one.
 			t.imm = t.memTable
 			t.memTable = NewSkipList()
+
+			t.emit(Event{Type: EventFlushBegin, Stats: t.statsLocked()})
+
 			// Reset WAL — the immutable MemTable's data is about to be persisted
 			// to an SSTable so the WAL entries for it are no longer needed.
 			// New writes go to the fresh MemTable and fresh WAL.
@@ -334,6 +442,8 @@ func (t *LSMTree) flushLoop() {
 				fmt.Fprintf(os.Stderr, "lsm: wal reset failed: %v\n", err)
 				continue
 			}
+
+			t.emit(Event{Type: EventWALReset, Stats: t.statsLocked()})
 			t.mu.Unlock()
 
 			if err := t.flushMemTable(); err != nil {
@@ -390,6 +500,8 @@ func (t *LSMTree) flushMemTable() error {
 	t.levels[0] = append(t.levels[0], reader)
 	t.imm = nil
 	needsCompaction := len(t.levels[0]) >= t.l0CompactionThreshold
+
+	t.emit(Event{Type: EventFlushComplete, SSTPath: path, Level: 0, Stats: t.statsLocked()})
 	t.mu.Unlock()
 
 	if needsCompaction {
@@ -427,6 +539,8 @@ func (t *LSMTree) compactL0() error {
 		t.mu.Unlock()
 		return nil
 	}
+
+	t.emit(Event{Type: EventCompactBegin, Stats: t.statsLocked()})
 
 	// Snapshot the readers we'll compact.
 	l0Readers := make([]*SSTableReader, len(t.levels[0]))
@@ -481,6 +595,8 @@ func (t *LSMTree) compactL0() error {
 	t.levels[1] = removeReaders(t.levels[1], l1Readers)
 	// Add the new L1 SSTable.
 	t.levels[1] = append(t.levels[1], newReader)
+
+	t.emit(Event{Type: EventCompactComplete, SSTPath: newPath, Level: 1, Stats: t.statsLocked()})
 	t.mu.Unlock()
 
 	// Close and delete old SSTable files.

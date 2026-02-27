@@ -1,27 +1,27 @@
-package main
+package engine
 
 import (
 	"bufio"
 	"encoding/binary"
+	"io"
 	"os"
 	"sync"
-	"io"
 )
 
 type WALEntry struct {
-	Op byte
-	Key []byte
+	Op    byte
+	Key   []byte
 	Value []byte
 }
 
 type WAL struct {
-	file *os.File
+	file   *os.File
 	writer *bufio.Writer
-	mu sync.Mutex
+	mu     sync.Mutex
 }
 
 const (
-	OpPut = 0
+	OpPut    = 0
 	OpDelete = 1
 )
 
@@ -145,4 +145,13 @@ func (w *WAL) Close() error {
 	defer w.mu.Unlock()
 	w.writer.Flush()
 	return w.file.Close()
+}
+
+// EntryCount returns the number of entries currently in the WAL.
+func (w *WAL) EntryCount() int {
+	entries, err := w.ReadAll()
+	if err != nil {
+		return 0
+	}
+	return len(entries)
 }

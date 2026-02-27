@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"distributed-kv/engine"
 	"distributed-kv/pb"
 	"distributed-kv/raft"
 
@@ -16,13 +17,13 @@ import (
 // through Raft consensus; reads stay local.
 type KVServer struct {
 	pb.UnimplementedKVServiceServer
-	tree     *LSMTree
+	tree     *engine.LSMTree
 	raftNode *raft.RaftNode
 }
 
 // NewKVServer creates a KVServer backed by the given LSMTree.
 // Pass nil for raftNode to run in standalone mode.
-func NewKVServer(tree *LSMTree, raftNode *raft.RaftNode) *KVServer {
+func NewKVServer(tree *engine.LSMTree, raftNode *raft.RaftNode) *KVServer {
 	return &KVServer{tree: tree, raftNode: raftNode}
 }
 

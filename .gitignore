@@ -1,0 +1,5 @@
+# Compiled binary
+distributed-kv
+
+# Data directories (local runtime state)
+data/

@@ -1,4 +1,4 @@
-package main
+package engine
 
 import (
 	"bufio"
@@ -25,8 +25,8 @@ type SSTableEntry struct {
 	Deleted bool
 }
 
-// sstIndexEntry is one entry in the sparse in-memory index.
-type sstIndexEntry struct {
+// SSTIndexEntry is one entry in the sparse in-memory index.
+type SSTIndexEntry struct {
 	Key    []byte
 	Offset int64 // byte offset of this entry in the data section
 }
@@ -119,7 +119,7 @@ type SSTableWriter struct {
 	path         string
 	file         *os.File
 	buf          *bufio.Writer
-	index        []sstIndexEntry
+	index        []SSTIndexEntry
 	entryCount   int
 	bytesWritten int64
 }
@@ -142,7 +142,7 @@ func NewSSTableWriter(path string) (*SSTableWriter, error) {
 func (w *SSTableWriter) Write(e SSTableEntry) error {
 	// Record a sparse index entry at every sstIndexSparseness-th entry.
 	if w.entryCount%sstIndexSparseness == 0 {
-		w.index = append(w.index, sstIndexEntry{
+		w.index = append(w.index, SSTIndexEntry{
 			Key:    append([]byte(nil), e.Key...),
 			Offset: w.bytesWritten,
 		})
@@ -212,7 +212,7 @@ func (w *SSTableWriter) Finalize() error {
 type SSTableReader struct {
 	path     string
 	file     *os.File
-	index    []sstIndexEntry
+	index    []SSTIndexEntry
 	dataSize int64 // byte offset where the index block begins
 }
 
@@ -267,7 +267,7 @@ func (r *SSTableReader) loadIndex() error {
 	}
 
 	rd := bytes.NewReader(indexBuf)
-	r.index = make([]sstIndexEntry, 0, numEntries)
+	r.index = make([]SSTIndexEntry, 0, numEntries)
 	for i := int64(0); i < numEntries; i++ {
 		var keyLen int32
 		if err := binary.Read(rd, binary.LittleEndian, &keyLen); err != nil {
@@ -281,7 +281,7 @@ func (r *SSTableReader) loadIndex() error {
 		if _, err := io.ReadFull(rd, key); err != nil {
 			return fmt.Errorf("sstable: index entry %d key: %w", i, err)
 		}
-		r.index = append(r.index, sstIndexEntry{Key: key, Offset: off})
+		r.index = append(r.index, SSTIndexEntry{Key: key, Offset: off})
 	}
 	return nil
 }
@@ -344,6 +344,30 @@ func (r *SSTableReader) Iterator() *SSTableIterator {
 
 // Close releases the underlying file descriptor.
 func (r *SSTableReader) Close() error { return r.file.Close() }
+
+// ──────────────────────────────────────────────────────────────
+//  Visualization accessors
+// ──────────────────────────────────────────────────────────────
+
+// IndexEntries returns the sparse index for visualization.
+func (r *SSTableReader) IndexEntries() []SSTIndexEntry { return r.index }
+
+// DataSize returns the byte offset where the data section ends (index begins).
+func (r *SSTableReader) DataSize() int64 { return r.dataSize }
+
+// AllEntries reads and returns every entry in the SSTable.
+func (r *SSTableReader) AllEntries() ([]SSTableEntry, error) {
+	it := r.Iterator()
+	var out []SSTableEntry
+	for it.Valid() {
+		out = append(out, it.Entry())
+		it.Next()
+	}
+	if err := it.Error(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
 // ──────────────────────────────────────────────────────────────
 //  Iterator

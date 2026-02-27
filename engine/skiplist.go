@@ -1,4 +1,4 @@
-package main
+package engine
 
 import (
 	"bytes"
@@ -233,4 +233,34 @@ func (s *SkipList) Len() int {
 		current = current.next[0]
 	}
 	return count
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Visualization accessors
+// ──────────────────────────────────────────────────────────────
+
+// NodesWithLevels returns metadata about each node for visualization.
+func (s *SkipList) NodesWithLevels() []SkipListNode {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var nodes []SkipListNode
+	current := s.head.next[0]
+	for current != nil {
+		nodes = append(nodes, SkipListNode{
+			Key:     string(current.key),
+			Value:   string(current.value),
+			Deleted: current.value == nil,
+			Level:   len(current.next),
+		})
+		current = current.next[0]
+	}
+	return nodes
+}
+
+// CurrentLevel returns the current maximum level of the skip list.
+func (s *SkipList) CurrentLevel() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.level
 }

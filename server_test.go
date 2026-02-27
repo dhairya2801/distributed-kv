@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"distributed-kv/engine"
 	"distributed-kv/pb"
 
 	"google.golang.org/grpc"
@@ -18,7 +19,7 @@ func startTestServer(t *testing.T) (pb.KVServiceClient, func()) {
 	t.Helper()
 
 	dir := tempDir(t) // from lsmtree_test.go
-	tree, err := OpenLSMTree(dir)
+	tree, err := engine.OpenLSMTree(dir)
 	if err != nil {
 		t.Fatal(err)
 	}

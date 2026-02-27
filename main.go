@@ -9,6 +9,7 @@ import (
 	"strings"
 	"syscall"
 
+	"distributed-kv/engine"
 	"distributed-kv/pb"
 	"distributed-kv/raft"
 
@@ -23,7 +24,7 @@ func main() {
 	flag.Parse()
 
 	// ── Open storage engine ────────────────────────────────
-	tree, err := OpenLSMTree(*dataDir)
+	tree, err := engine.OpenLSMTree(*dataDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to open LSM tree: %v\n", err)
 		os.Exit(1)

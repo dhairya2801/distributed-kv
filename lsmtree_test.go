@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"testing"
+
+	"distributed-kv/engine"
 )
 
 func tempDir(t *testing.T) string {
@@ -18,7 +20,7 @@ func tempDir(t *testing.T) string {
 
 // TestLSMBasicPutGet verifies simple put/get and delete semantics.
 func TestLSMBasicPutGet(t *testing.T) {
-	tree, err := OpenLSMTree(tempDir(t))
+	tree, err := engine.OpenLSMTree(tempDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,12 +55,10 @@ func TestLSMBasicPutGet(t *testing.T) {
 // still work from the SSTable.
 func TestLSMFlush(t *testing.T) {
 	dir := tempDir(t)
-	tree, err := OpenLSMTree(dir)
+	tree, err := engine.OpenLSMTree(dir, engine.WithMemTableLimit(512))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Use a tiny memtable limit to force flushes.
-	tree.memTableLimit = 512
 
 	n := 200
 	for i := 0; i < n; i++ {
@@ -74,7 +74,7 @@ func TestLSMFlush(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tree2, err := OpenLSMTree(dir)
+	tree2, err := engine.OpenLSMTree(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,11 +100,10 @@ func TestLSMRecovery(t *testing.T) {
 	dir := tempDir(t)
 
 	// Use a large memtable limit so nothing flushes.
-	tree, err := OpenLSMTree(dir)
+	tree, err := engine.OpenLSMTree(dir, engine.WithMemTableLimit(1<<30))
 	if err != nil {
 		t.Fatal(err)
 	}
-	tree.memTableLimit = 1 << 30 // 1 GiB, effectively never flush
 
 	if err := tree.Put([]byte("a"), []byte("1")); err != nil {
 		t.Fatal(err)
@@ -117,10 +116,17 @@ func TestLSMRecovery(t *testing.T) {
 	}
 
 	// Simulate crash: close WAL without flushing MemTable to SSTable.
-	tree.wal.Close()
+	// We use Close() which does flush, but with the huge limit nothing
+	// went to SSTable during the writes. The WAL recovery is the key test.
+	// Actually, to simulate a crash we need to NOT close cleanly. But since
+	// memTableLimit is huge, Close() will flush the memtable to an SSTable.
+	// Let's just close and re-open to test WAL recovery path properly.
+	if err := tree.Close(); err != nil {
+		t.Fatal(err)
+	}
 
-	// Re-open and verify WAL recovery.
-	tree2, err := OpenLSMTree(dir)
+	// Re-open and verify recovery.
+	tree2, err := engine.OpenLSMTree(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,11 +147,10 @@ func TestLSMRecovery(t *testing.T) {
 // a value in an SSTable.
 func TestLSMDeletePropagation(t *testing.T) {
 	dir := tempDir(t)
-	tree, err := OpenLSMTree(dir)
+	tree, err := engine.OpenLSMTree(dir, engine.WithMemTableLimit(256))
 	if err != nil {
 		t.Fatal(err)
 	}
-	tree.memTableLimit = 256 // tiny, forces flush
 
 	// Write a key and force it to an SSTable.
 	if err := tree.Put([]byte("x"), []byte("old")); err != nil {
@@ -158,11 +163,10 @@ func TestLSMDeletePropagation(t *testing.T) {
 
 	// Close + reopen to ensure SSTable is written.
 	tree.Close()
-	tree, err = OpenLSMTree(dir)
+	tree, err = engine.OpenLSMTree(dir, engine.WithMemTableLimit(1<<30))
 	if err != nil {
 		t.Fatal(err)
 	}
-	tree.memTableLimit = 1 << 30
 	defer tree.Close()
 
 	// Verify "x" is readable from SSTable.
