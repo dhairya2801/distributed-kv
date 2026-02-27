@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package kvpb;
+
+option go_package = "distributed-kv/pb";
+
+// ──────────────────────────────────────────────────────────────
+//  KV Service — client-facing API
+// ──────────────────────────────────────────────────────────────
+
+service KVService {
+  rpc Get    (GetRequest)    returns (GetResponse);
+  rpc Put    (PutRequest)    returns (PutResponse);
+  rpc Delete (DeleteRequest) returns (DeleteResponse);
+}
+
+message GetRequest {
+  bytes key = 1;
+}
+
+message GetResponse {
+  bytes value = 1;
+  bool  found = 2;
+}
+
+message PutRequest {
+  bytes key   = 1;
+  bytes value = 2;
+}
+
+message PutResponse {}
+
+message DeleteRequest {
+  bytes key = 1;
+}
+
+message DeleteResponse {}
+
+// ──────────────────────────────────────────────────────────────
+//  Raft Service — internal node-to-node RPCs
+// ──────────────────────────────────────────────────────────────
+
+service RaftService {
+  rpc RequestVote   (VoteRequest)          returns (VoteResponse);
+  rpc AppendEntries (AppendEntriesRequest) returns (AppendEntriesResponse);
+}
+
+message LogEntry {
+  uint64 term  = 1;
+  uint64 index = 2;
+  bytes  data  = 3;  // encoded KV operation
+}
+
+message VoteRequest {
+  uint64 term           = 1;
+  string candidate_id   = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term  = 4;
+}
+
+message VoteResponse {
+  uint64 term         = 1;
+  bool   vote_granted = 2;
+}
+
+message AppendEntriesRequest {
+  uint64          term           = 1;
+  string          leader_id      = 2;
+  uint64          prev_log_index = 3;
+  uint64          prev_log_term  = 4;
+  repeated LogEntry entries      = 5;
+  uint64          leader_commit  = 6;
+}
+
+message AppendEntriesResponse {
+  uint64 term    = 1;
+  bool   success = 2;
+}
