@@ -550,21 +550,15 @@ func (t *LSMTree) compactL0() error {
 	for len(t.levels) < 2 {
 		t.levels = append(t.levels, nil)
 	}
-	l1Readers := make([]*SSTableReader, len(t.levels[1]))
-	copy(l1Readers, t.levels[1])
 	t.mu.Unlock()
 
-	// Collect all iterators for the k-way merge.
-	iters := make([]*SSTableIterator, 0, len(l0Readers)+len(l1Readers))
+	// Merge only the L0 SSTables into a new L1 file; existing L1 files are
+	// left untouched so L1 accumulates multiple SSTables over time.
+	iters := make([]*SSTableIterator, 0, len(l0Readers))
 	for _, r := range l0Readers {
 		iters = append(iters, r.Iterator())
 	}
-	for _, r := range l1Readers {
-		iters = append(iters, r.Iterator())
-	}
 
-	// Merge all entries. L0 readers appear first (newest = higher index takes
-	// priority for duplicate keys).
 	merged := kWayMerge(iters, len(l0Readers))
 
 	// Write merged entries to a new L1 SSTable.
@@ -589,23 +583,16 @@ func (t *LSMTree) compactL0() error {
 
 	// Swap old readers for new ones under the lock.
 	t.mu.Lock()
-	// Remove compacted L0 readers.
+	// Remove compacted L0 readers; leave L1 intact.
 	t.levels[0] = removeReaders(t.levels[0], l0Readers)
-	// Remove compacted L1 readers.
-	t.levels[1] = removeReaders(t.levels[1], l1Readers)
-	// Add the new L1 SSTable.
+	// Append the new L1 SSTable.
 	t.levels[1] = append(t.levels[1], newReader)
 
 	t.emit(Event{Type: EventCompactComplete, SSTPath: newPath, Level: 1, Stats: t.statsLocked()})
 	t.mu.Unlock()
 
-	// Close and delete old SSTable files.
+	// Close and delete old L0 SSTable files.
 	for _, r := range l0Readers {
-		path := r.Path()
-		r.Close()
-		os.Remove(path)
-	}
-	for _, r := range l1Readers {
 		path := r.Path()
 		r.Close()
 		os.Remove(path)

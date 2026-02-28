@@ -37,7 +37,7 @@ func main() {
 	// Create a demo LSMTree with small thresholds for visualization.
 	tree, err := engine.OpenLSMTree(dir,
 		engine.WithMemTableLimit(512),
-		engine.WithL0CompactionThreshold(2),
+		engine.WithL0CompactionThreshold(4),
 	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to open LSM tree: %v\n", err)

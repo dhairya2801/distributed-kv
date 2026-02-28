@@ -130,7 +130,23 @@ input[type="text"]:focus { outline: none; border-color: var(--accent); }
 .panel-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 /* MemTable Panel */
 .memtable-panel { grid-column: 1; grid-row: 1; }
-.skiplist-svg { width: 100%; }
+.memtable-panel .panel-body { overflow-x: auto; overflow-y: hidden; cursor: pointer; }
+.memtable-panel .panel-body::-webkit-scrollbar { height: 6px; }
+.memtable-panel .panel-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+.skiplist-svg { min-width: 100%; width: auto; }
+.expand-btn {
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 14px;
+  background: none;
+  border: none;
+  padding: 0 4px;
+  transition: color 0.2s;
+}
+.expand-btn:hover { color: var(--accent); }
+/* Skip List expanded modal */
+.modal.modal-wide { max-width: 90vw; width: auto; }
+.modal.modal-wide .skiplist-modal-body { overflow-x: auto; padding: 12px 0; }
 .sl-node {
   cursor: default;
   transition: opacity 0.3s;
@@ -327,6 +343,20 @@ input[type="text"]:focus { outline: none; border-color: var(--accent); }
 }
 .connection-status.connected { background: var(--green); }
 .connection-status.disconnected { background: var(--red); }
+/* Notification toast */
+.notification {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  padding: 8px 16px;
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  color: var(--accent);
+  font-size: 12px;
+  z-index: 300;
+  animation: fadeIn 0.2s;
+}
 </style>
 </head>
 <body>
@@ -347,7 +377,7 @@ input[type="text"]:focus { outline: none; border-color: var(--accent); }
   <button class="btn btn-danger" onclick="doDelete()">Delete</button>
   <button class="btn btn-green" onclick="doGet()">Get</button>
   <div class="separator"></div>
-  <button class="btn" onclick="doBulk()">Bulk Insert 100</button>
+  <button class="btn" onclick="doBulk()">Bulk Insert 20</button>
   <button class="btn" onclick="doFlush()">Force Flush</button>
 </div>
 
@@ -356,9 +386,9 @@ input[type="text"]:focus { outline: none; border-color: var(--accent); }
   <div class="panel memtable-panel">
     <div class="panel-header">
       <span>MemTable (Skip List)</span>
-      <span id="memBadge"></span>
+      <span><span id="memBadge"></span><button class="expand-btn" onclick="openSkipListModal()" title="Expand">&#x26F6;</button></span>
     </div>
-    <div class="panel-body" id="memtableBody">
+    <div class="panel-body" id="memtableBody" onclick="openSkipListModal()" title="Click to expand">
       <svg id="skiplistSvg" class="skiplist-svg"></svg>
     </div>
   </div>
@@ -404,12 +434,8 @@ input[type="text"]:focus { outline: none; border-color: var(--accent); }
         <div class="stat-value" id="statMemEntries">0</div>
       </div>
       <div class="stat-item">
-        <div class="stat-label">Immutable MemTable</div>
-        <div class="stat-value" id="statImmEntries">—</div>
-      </div>
-      <div class="stat-item">
         <div class="stat-label">L0 SSTables</div>
-        <div class="stat-value" id="statL0">0 / 2</div>
+        <div class="stat-value" id="statL0">0 / 4</div>
         <div class="progress-bar"><div class="progress-fill" id="l0Progress" style="width:0%; background:var(--green)"></div></div>
       </div>
       <div class="stat-item">
@@ -520,7 +546,10 @@ function handleEvent(event) {
       break;
     case 'memtable_insert':
     case 'memtable_delete':
-      refreshSnapshot();
+      // Incrementally update the local snapshot so the skiplist renders
+      // one node at a time (especially important for slow mode).
+      addNodeToLocalSnapshot(event);
+      if (lastSnapshot) renderSkipList(lastSnapshot.memTable);
       break;
     case 'flush_begin':
       document.getElementById('memBadge').innerHTML = '<span class="flush-badge">FLUSHING</span>';
@@ -538,6 +567,11 @@ function handleEvent(event) {
       break;
     case 'wal_reset':
       clearWAL();
+      // MemTable was rotated — clear local memtable nodes since it's now empty.
+      if (lastSnapshot) {
+        lastSnapshot.memTable = { entries: [], nodes: [], level: 1 };
+        renderSkipList(lastSnapshot.memTable);
+      }
       break;
     case 'get_begin':
       searchHighlightKey = event.key;
@@ -555,6 +589,50 @@ function handleEvent(event) {
     case 'get_result':
       searchHighlightKey = null;
       break;
+  }
+}
+
+// Incrementally add/update a node in the local snapshot from event data.
+// This avoids fetching a full snapshot on every insert, enabling true
+// one-by-one rendering in slow mode.
+function addNodeToLocalSnapshot(event) {
+  if (!lastSnapshot) {
+    lastSnapshot = { memTable: { entries: [], nodes: [], level: 1 }, levels: [[], []], stats: {} };
+  }
+  const mt = lastSnapshot.memTable;
+  // Guard against Go nil slices which serialize as JSON null.
+  if (!mt.nodes) mt.nodes = [];
+  if (!mt.entries) mt.entries = [];
+  if (!mt.level) mt.level = 1;
+  const key = event.key;
+  const value = event.value || '';
+  const deleted = event.type === 'memtable_delete';
+
+  // Update or insert in entries array (sorted by key).
+  let entryIdx = mt.entries.findIndex(e => e.key === key);
+  if (entryIdx >= 0) {
+    mt.entries[entryIdx] = { key, value, deleted };
+  } else {
+    // Insert in sorted position.
+    let pos = mt.entries.findIndex(e => e.key > key);
+    if (pos < 0) pos = mt.entries.length;
+    mt.entries.splice(pos, 0, { key, value, deleted });
+  }
+
+  // Update or insert in nodes array (sorted by key).
+  let nodeIdx = mt.nodes.findIndex(n => n.key === key);
+  if (nodeIdx >= 0) {
+    mt.nodes[nodeIdx].value = value;
+    mt.nodes[nodeIdx].deleted = deleted;
+  } else {
+    // Random level for the skip list node (1-based, geometric distribution).
+    let level = 1;
+    while (Math.random() < 0.5 && level < 12) level++;
+    let pos = mt.nodes.findIndex(n => n.key > key);
+    if (pos < 0) pos = mt.nodes.length;
+    mt.nodes.splice(pos, 0, { key, value, deleted, level });
+    // Update max level.
+    if (level > mt.level) mt.level = level;
   }
 }
 
@@ -589,7 +667,9 @@ async function doGet() {
 }
 
 async function doBulk() {
-  await fetch('/api/bulk', { method: 'POST', body: JSON.stringify({ count: 100, prefix: 'key' }) });
+  const resp = await fetch('/api/bulk', { method: 'POST', body: JSON.stringify({ count: 20, prefix: 'key' }) });
+  const data = await resp.json();
+  if (data.from !== undefined) showNotification(`Inserted key${String(data.from).padStart(4,'0')} — key${String(data.to).padStart(4,'0')}`);
 }
 
 async function doFlush() {
@@ -792,7 +872,6 @@ function updateStats(stats) {
 
   document.getElementById('statMemSize').textContent = `${formatBytes(stats.memTableSize)} / ${formatBytes(stats.memTableCapacity)}`;
   document.getElementById('statMemEntries').textContent = stats.memTableEntries;
-  document.getElementById('statImmEntries').textContent = stats.immEntries > 0 ? `${stats.immEntries} entries (flushing)` : '—';
   document.getElementById('statL0').textContent = `${stats.l0Count} / ${stats.l0Threshold}`;
   document.getElementById('statL1').textContent = stats.l1Count;
   document.getElementById('statWAL').textContent = stats.walEntries;
@@ -886,6 +965,85 @@ async function openSSTableModal(path) {
 function closeModal(event) {
   if (event && event.target !== document.getElementById('modalOverlay')) return;
   document.getElementById('modalOverlay').classList.remove('active');
+  document.querySelector('#modalOverlay .modal').classList.remove('modal-wide');
+}
+
+function openSkipListModal() {
+  if (!lastSnapshot || !lastSnapshot.memTable) return;
+  const modal = document.querySelector('#modalOverlay .modal');
+  modal.classList.add('modal-wide');
+  document.getElementById('modalTitle').textContent = 'MemTable — Skip List (Full View)';
+
+  const memTable = lastSnapshot.memTable;
+  const nodes = memTable.nodes || [];
+  const maxLevel = memTable.level || 1;
+  const nodeW = 70, nodeH = 22, levelGap = 28, colGap = 12;
+  const padLeft = 40, padTop = 20;
+  const height = Math.max(100, padTop + maxLevel * levelGap + 30);
+  const svgWidth = Math.max(600, padLeft + nodes.length * (nodeW + colGap) + 20);
+
+  document.getElementById('modalContent').innerHTML =
+    `<div class="skiplist-modal-body"><svg width="${svgWidth}" height="${height}" id="skiplistModalSvg"></svg></div>`;
+  document.getElementById('modalOverlay').classList.add('active');
+
+  const svg = d3.select('#skiplistModalSvg');
+  svg.append('defs').append('marker')
+    .attr('id', 'arrowhead-modal')
+    .attr('viewBox', '0 0 10 7')
+    .attr('refX', 10).attr('refY', 3.5)
+    .attr('markerWidth', 6).attr('markerHeight', 5)
+    .attr('orient', 'auto')
+    .append('polygon')
+    .attr('points', '0 0, 10 3.5, 0 7')
+    .attr('fill', 'var(--border)');
+
+  for (let l = 0; l < maxLevel; l++) {
+    svg.append('text')
+      .attr('x', 4)
+      .attr('y', padTop + (maxLevel - 1 - l) * levelGap + nodeH / 2 + 4)
+      .attr('fill', 'var(--text-dim)')
+      .attr('font-size', '9px')
+      .text('L' + l);
+  }
+
+  nodes.forEach((node, i) => {
+    const x = padLeft + i * (nodeW + colGap);
+    const nodeLevel = node.level || 1;
+    for (let l = 0; l < nodeLevel && l < maxLevel; l++) {
+      const y = padTop + (maxLevel - 1 - l) * levelGap;
+      svg.append('rect')
+        .attr('x', x).attr('y', y)
+        .attr('width', nodeW).attr('height', nodeH)
+        .attr('rx', 4).attr('ry', 4)
+        .attr('fill', node.deleted ? 'rgba(248,81,73,0.15)' : 'rgba(88,166,255,0.1)')
+        .attr('stroke', node.deleted ? 'var(--red)' : 'var(--accent)')
+        .attr('stroke-width', 1.5);
+      if (l === 0) {
+        const label = node.deleted ? node.key + ' [DEL]' : node.key;
+        svg.append('text')
+          .attr('x', x + nodeW / 2).attr('y', y + nodeH / 2 + 4)
+          .attr('text-anchor', 'middle')
+          .attr('fill', node.deleted ? 'var(--red)' : 'var(--text)')
+          .attr('font-size', '10px')
+          .text(label.length > 10 ? label.slice(0, 9) + '\u2026' : label);
+      }
+      if (i < nodes.length - 1) {
+        let nextIdx = -1;
+        for (let j = i + 1; j < nodes.length; j++) {
+          if ((nodes[j].level || 1) > l) { nextIdx = j; break; }
+        }
+        if (nextIdx >= 0) {
+          const nx = padLeft + nextIdx * (nodeW + colGap);
+          svg.append('line')
+            .attr('x1', x + nodeW).attr('y1', y + nodeH / 2)
+            .attr('x2', nx).attr('y2', y + nodeH / 2)
+            .attr('stroke', 'var(--border)')
+            .attr('stroke-width', 1)
+            .attr('marker-end', 'url(#arrowhead-modal)');
+        }
+      }
+    }
+  });
 }
 
 // ──────────────────────────────────────────
@@ -916,6 +1074,14 @@ function formatBytes(bytes) {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function showNotification(msg) {
+  const el = document.createElement('div');
+  el.className = 'notification';
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => { el.style.animation = 'fadeOut 0.3s forwards'; setTimeout(() => el.remove(), 300); }, 2000);
 }
 
 function escapeHtml(str) {

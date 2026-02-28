@@ -18,8 +18,9 @@ type Handler struct {
 	tree        *engine.LSMTree
 	broadcaster *Broadcaster
 	dataDir     string
+	bulkCounter int
 
-	mu sync.Mutex // protects tree reset
+	mu sync.Mutex // protects tree reset and bulkCounter
 }
 
 // NewHandler creates a new Handler.
@@ -152,23 +153,29 @@ func (h *Handler) handleBulk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Count <= 0 {
-		req.Count = 100
+		req.Count = 20
 	}
 	if req.Prefix == "" {
 		req.Prefix = "key"
 	}
 	h.mu.Lock()
-	for i := 0; i < req.Count; i++ {
+	start := h.bulkCounter
+	h.bulkCounter += req.Count
+	h.mu.Unlock()
+
+	// Insert one key at a time WITHOUT holding h.mu for the entire batch.
+	// This lets each Put's events (wal_write, memtable_insert) stream to
+	// the frontend individually, enabling real-time slow-mode visualization.
+	for i := start; i < start+req.Count; i++ {
 		key := fmt.Sprintf("%s%04d", req.Prefix, i)
 		val := fmt.Sprintf("value%04d", i)
 		if err := h.tree.Put([]byte(key), []byte(val)); err != nil {
-			h.mu.Unlock()
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}
-	h.mu.Unlock()
-	writeJSON(w, map[string]interface{}{"status": "ok", "inserted": req.Count})
+	end := start + req.Count - 1
+	writeJSON(w, map[string]interface{}{"status": "ok", "inserted": req.Count, "from": start, "to": end})
 }
 
 func (h *Handler) handleSnapshot(w http.ResponseWriter, r *http.Request) {
@@ -284,7 +291,7 @@ func (h *Handler) handleReset(w http.ResponseWriter, r *http.Request) {
 
 	tree, err := engine.OpenLSMTree(h.dataDir,
 		engine.WithMemTableLimit(512),
-		engine.WithL0CompactionThreshold(2),
+		engine.WithL0CompactionThreshold(4),
 	)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -292,6 +299,7 @@ func (h *Handler) handleReset(w http.ResponseWriter, r *http.Request) {
 	}
 	tree.SetObserver(h.broadcaster)
 	h.tree = tree
+	h.bulkCounter = 0
 	writeJSON(w, map[string]string{"status": "ok"})
 }
 
