@@ -349,6 +349,29 @@ func (r *SSTableReader) Close() error { return r.file.Close() }
 //  Visualization accessors
 // ──────────────────────────────────────────────────────────────
 
+// KeyRange returns the smallest and largest key in this SSTable.
+// Returns (nil, nil) if the SSTable is empty.
+func (r *SSTableReader) KeyRange() (minKey, maxKey []byte) {
+	if len(r.index) == 0 {
+		return nil, nil
+	}
+	// The first index entry has the smallest key.
+	minKey = r.index[0].Key
+
+	// To get the true max key we scan from the last index entry to EOF.
+	lastIdx := r.index[len(r.index)-1]
+	sr := io.NewSectionReader(r.file, lastIdx.Offset, r.dataSize-lastIdx.Offset)
+	rd := bufio.NewReaderSize(sr, sstReadBufSize)
+	for {
+		e, err := sstDecodeEntry(rd)
+		if err != nil {
+			break
+		}
+		maxKey = e.Key
+	}
+	return minKey, maxKey
+}
+
 // IndexEntries returns the sparse index for visualization.
 func (r *SSTableReader) IndexEntries() []SSTIndexEntry { return r.index }
 

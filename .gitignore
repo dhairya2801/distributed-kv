@@ -3,3 +3,4 @@ distributed-kv
 
 # Data directories (local runtime state)
 data/
+dhairya_comments.txt

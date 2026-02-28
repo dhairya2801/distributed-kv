@@ -532,7 +532,8 @@ func (t *LSMTree) compactLoop() {
 }
 
 // compactL0 merges all L0 SSTables and any overlapping L1 SSTables into
-// new L1 SSTables, then removes the old files.
+// new L1 SSTables, then removes the old files. This ensures L1 maintains
+// non-overlapping key ranges across all its SSTables.
 func (t *LSMTree) compactL0() error {
 	t.mu.Lock()
 	if len(t.levels[0]) < t.l0CompactionThreshold {
@@ -550,16 +551,48 @@ func (t *LSMTree) compactL0() error {
 	for len(t.levels) < 2 {
 		t.levels = append(t.levels, nil)
 	}
+
+	// Determine the key range covered by L0 SSTables.
+	var l0Min, l0Max []byte
+	for _, r := range l0Readers {
+		rMin, rMax := r.KeyRange()
+		if rMin == nil {
+			continue
+		}
+		if l0Min == nil || bytes.Compare(rMin, l0Min) < 0 {
+			l0Min = rMin
+		}
+		if l0Max == nil || bytes.Compare(rMax, l0Max) > 0 {
+			l0Max = rMax
+		}
+	}
+
+	// Find all L1 SSTables whose key range overlaps with the L0 range.
+	var l1Overlapping []*SSTableReader
+	for _, r := range t.levels[1] {
+		rMin, rMax := r.KeyRange()
+		if rMin == nil {
+			continue
+		}
+		// Overlaps if NOT (rMax < l0Min || rMin > l0Max).
+		if l0Min != nil && !(bytes.Compare(rMax, l0Min) < 0 || bytes.Compare(rMin, l0Max) > 0) {
+			l1Overlapping = append(l1Overlapping, r)
+		}
+	}
+
 	t.mu.Unlock()
 
-	// Merge only the L0 SSTables into a new L1 file; existing L1 files are
-	// left untouched so L1 accumulates multiple SSTables over time.
-	iters := make([]*SSTableIterator, 0, len(l0Readers))
+	// Build iterators: L0 first (oldest→newest), then overlapping L1.
+	numL0 := len(l0Readers)
+	iters := make([]*SSTableIterator, 0, numL0+len(l1Overlapping))
 	for _, r := range l0Readers {
 		iters = append(iters, r.Iterator())
 	}
+	for _, r := range l1Overlapping {
+		iters = append(iters, r.Iterator())
+	}
 
-	merged := kWayMerge(iters, len(l0Readers))
+	merged := kWayMerge(iters, numL0)
 
 	// Write merged entries to a new L1 SSTable.
 	newPath := t.nextSSTPath(1)
@@ -583,16 +616,28 @@ func (t *LSMTree) compactL0() error {
 
 	// Swap old readers for new ones under the lock.
 	t.mu.Lock()
-	// Remove compacted L0 readers; leave L1 intact.
+	// Remove compacted L0 readers.
 	t.levels[0] = removeReaders(t.levels[0], l0Readers)
+	// Remove overlapping L1 readers that were merged in.
+	t.levels[1] = removeReaders(t.levels[1], l1Overlapping)
 	// Append the new L1 SSTable.
 	t.levels[1] = append(t.levels[1], newReader)
+	// Keep L1 sorted by key range for efficient lookups.
+	sort.Slice(t.levels[1], func(i, j int) bool {
+		return t.levels[1][i].Path() < t.levels[1][j].Path()
+	})
 
 	t.emit(Event{Type: EventCompactComplete, SSTPath: newPath, Level: 1, Stats: t.statsLocked()})
 	t.mu.Unlock()
 
 	// Close and delete old L0 SSTable files.
 	for _, r := range l0Readers {
+		path := r.Path()
+		r.Close()
+		os.Remove(path)
+	}
+	// Close and delete old overlapping L1 SSTable files.
+	for _, r := range l1Overlapping {
 		path := r.Path()
 		r.Close()
 		os.Remove(path)
@@ -622,20 +667,31 @@ func removeReaders(all, toRemove []*SSTableReader) []*SSTableReader {
 // ──────────────────────────────────────────────────────────────
 
 // kWayMerge merges entries from multiple SSTable iterators into a single
-// sorted slice. When duplicate keys appear, the entry from the iterator
-// with the higher index wins (newer data). The first numL0 iterators are
-// from L0 and are ordered oldest→newest; remaining iterators are L1.
+// sorted slice. When duplicate keys appear, the entry with the highest
+// priority wins. The first numL0 iterators are from L0 ordered
+// oldest→newest; remaining iterators (index >= numL0) are from L1.
 //
-// For duplicate keys across L0 and L1, the latest L0 entry wins.
+// Priority: L0 entries always beat L1. Within L0, later iterators
+// (higher index) are newer and beat earlier ones.
 func kWayMerge(iters []*SSTableIterator, numL0 int) []SSTableEntry {
-	// Collect all entries tagged with their source iterator index.
+	// Collect all entries tagged with a priority. Higher priority = newer.
 	type tagged struct {
-		entry SSTableEntry
-		src   int // iterator index; higher = newer for L0
+		entry    SSTableEntry
+		priority int // higher = newer
 	}
 
 	var all []tagged
 	for i, it := range iters {
+		// L0 iterators (index 0..numL0-1): priority = numL0 + i
+		//   (so even the oldest L0 beats any L1 entry)
+		// L1 iterators (index numL0+):     priority = i - numL0
+		//   (L1 entries are all older than L0)
+		var pri int
+		if i < numL0 {
+			pri = numL0 + i
+		} else {
+			pri = i - numL0
+		}
 		for ; it.Valid(); it.Next() {
 			e := it.Entry()
 			// Copy key/value so we don't alias the iterator's buffer.
@@ -646,18 +702,18 @@ func kWayMerge(iters []*SSTableIterator, numL0 int) []SSTableEntry {
 			if !e.Deleted {
 				entry.Value = append([]byte(nil), e.Value...)
 			}
-			all = append(all, tagged{entry: entry, src: i})
+			all = append(all, tagged{entry: entry, priority: pri})
 		}
 	}
 
-	// Sort by key ascending, then by source descending (so newer entries for
-	// the same key come first).
+	// Sort by key ascending, then by priority descending (so newer entries
+	// for the same key come first).
 	sort.SliceStable(all, func(i, j int) bool {
 		cmp := bytes.Compare(all[i].entry.Key, all[j].entry.Key)
 		if cmp != 0 {
 			return cmp < 0
 		}
-		return all[i].src > all[j].src // newer source wins
+		return all[i].priority > all[j].priority // newer wins
 	})
 
 	// Deduplicate: keep only the first entry per key (the newest).
