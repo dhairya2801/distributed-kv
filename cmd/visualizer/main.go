@@ -21,6 +21,12 @@ func main() {
 	dataDir := flag.String("data", "", "data directory (default: temp dir)")
 	flag.Parse()
 
+	// Render.com sets PORT env var; override flag if present.
+	if port := os.Getenv("PORT"); port != "" {
+		p := ":" + port
+		addr = &p
+	}
+
 	// Default to a temp directory.
 	dir := *dataDir
 	if dir == "" {

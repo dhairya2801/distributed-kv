@@ -1,0 +1,796 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Distributed KV — Raft Cluster</title>
+<style>
+:root {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --border: #30363d;
+  --text: #c9d1d9;
+  --text-dim: #8b949e;
+  --accent: #58a6ff;
+  --green: #3fb950;
+  --red: #f85149;
+  --yellow: #d29922;
+  --orange: #db6d28;
+  --purple: #bc8cff;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-x: hidden;
+}
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.header h1 { font-size: 16px; font-weight: 600; }
+.header h1 span { color: var(--accent); }
+.header-right { display: flex; gap: 10px; align-items: center; }
+.status-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--red);
+  display: inline-block;
+}
+.status-dot.connected { background: var(--green); }
+.toggle-btn {
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  transition: all 0.2s;
+}
+.toggle-btn:hover { border-color: var(--accent); }
+.toggle-btn.active { background: var(--accent); color: #000; border-color: var(--accent); }
+.controls {
+  display: flex;
+  gap: 8px;
+  padding: 10px 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+  align-items: center;
+}
+input[type="text"] {
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  width: 140px;
+}
+input[type="text"]:focus { outline: none; border-color: var(--accent); }
+.btn {
+  padding: 5px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  transition: all 0.15s;
+}
+.btn:hover { border-color: var(--accent); background: #1c2333; }
+.btn-primary { background: var(--accent); color: #000; border-color: var(--accent); }
+.btn-primary:hover { background: #79b8ff; }
+.btn-danger { border-color: var(--red); color: var(--red); }
+.btn-danger:hover { background: rgba(248,81,73,0.1); }
+.btn-green { border-color: var(--green); color: var(--green); }
+.btn-green:hover { background: rgba(63,185,80,0.1); }
+.separator { width: 1px; height: 24px; background: var(--border); }
+
+select {
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+select:focus { outline: none; border-color: var(--accent); }
+
+.main-layout {
+  display: grid;
+  grid-template-rows: auto auto 1fr;
+  height: calc(100vh - 92px);
+}
+
+/* Cluster nodes SVG area */
+.cluster-panel {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+  min-height: 200px;
+}
+.cluster-panel h2 {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin-bottom: 10px;
+  font-weight: 500;
+}
+
+/* Raft log + replication */
+.raft-panel {
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.raft-panel h3 {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+  font-weight: 500;
+}
+.log-strip {
+  display: flex;
+  gap: 3px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  max-height: 60px;
+  overflow-y: auto;
+}
+.log-entry {
+  width: 28px;
+  height: 24px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 600;
+  color: #fff;
+  cursor: default;
+  position: relative;
+}
+.log-entry.committed { border: 2px solid rgba(255,255,255,0.4); }
+.log-entry.uncommitted { border: 2px dashed rgba(255,255,255,0.3); }
+.replication-bars { display: flex; flex-direction: column; gap: 4px; }
+.repl-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+}
+.repl-label { width: 50px; color: var(--text-dim); }
+.repl-bar-bg {
+  flex: 1;
+  height: 12px;
+  background: var(--bg);
+  border-radius: 3px;
+  overflow: hidden;
+  max-width: 300px;
+}
+.repl-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.3s;
+  background: var(--accent);
+}
+.repl-text { width: 50px; font-size: 11px; color: var(--text-dim); }
+
+/* Event log */
+.event-panel {
+  overflow-y: auto;
+  padding: 8px 20px;
+  background: var(--bg);
+}
+.event-panel h3 {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+  font-weight: 500;
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  padding: 4px 0;
+}
+.event-line {
+  font-size: 11px;
+  padding: 2px 0;
+  border-bottom: 1px solid rgba(48,54,61,0.3);
+  display: flex;
+  gap: 8px;
+}
+.event-time { color: var(--text-dim); min-width: 80px; }
+.event-node { min-width: 50px; font-weight: 600; }
+.event-type { color: var(--accent); min-width: 160px; }
+.event-detail { color: var(--text-dim); }
+
+/* Node cards in SVG */
+.node-card {
+  cursor: pointer;
+  transition: transform 0.2s;
+}
+.node-card:hover { filter: brightness(1.15); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1><span>Distributed KV</span> — Raft Cluster</h1>
+  <div class="header-right">
+    <span class="status-dot" id="statusDot"></span>
+    <span id="statusText" style="font-size:12px;color:var(--text-dim)">Connecting...</span>
+    <button class="toggle-btn" id="slowModeBtn" onclick="toggleSlowMode()">Slow Mode</button>
+  </div>
+</div>
+
+<div class="controls">
+  <input type="text" id="keyInput" placeholder="Key">
+  <input type="text" id="valueInput" placeholder="Value">
+  <button class="btn btn-primary" onclick="clusterPut()">Put</button>
+  <button class="btn btn-danger" onclick="clusterDelete()">Delete</button>
+  <button class="btn" onclick="clusterGet()">Get</button>
+  <div class="separator"></div>
+  <button class="btn btn-green" onclick="clusterBulk()">Bulk 10</button>
+  <div class="separator"></div>
+  <select id="stopSelect">
+    <option value="">Stop Node...</option>
+    <option value="node0">node0</option>
+    <option value="node1">node1</option>
+    <option value="node2">node2</option>
+  </select>
+  <button class="btn btn-danger" onclick="stopNode()">Stop</button>
+  <select id="startSelect">
+    <option value="">Start Node...</option>
+    <option value="node0">node0</option>
+    <option value="node1">node1</option>
+    <option value="node2">node2</option>
+  </select>
+  <button class="btn btn-green" onclick="startNode()">Start</button>
+  <div class="separator"></div>
+  <span id="resultText" style="font-size:12px;color:var(--text-dim)"></span>
+</div>
+
+<div class="main-layout">
+  <div class="cluster-panel">
+    <h2>Cluster Topology</h2>
+    <svg id="clusterSvg" width="100%" height="170"></svg>
+  </div>
+
+  <div class="raft-panel">
+    <h3>Raft Log (Leader)</h3>
+    <div class="log-strip" id="logStrip"></div>
+    <h3>Replication Progress</h3>
+    <div class="replication-bars" id="replBars"></div>
+  </div>
+
+  <div class="event-panel" id="eventPanel">
+    <h3>Event Log</h3>
+    <div id="eventList"></div>
+  </div>
+</div>
+
+<script>
+// --- State ---
+const nodeIds = ['node0', 'node1', 'node2'];
+let state = {};
+nodeIds.forEach(id => {
+  state[id] = {
+    role: 'Follower', term: 0, commitIndex: 0, lastApplied: 0,
+    lastLogIndex: 0, leaderId: '', votedFor: '', peers: [], alive: true
+  };
+});
+let leaderLogEntries = [];
+let slowMode = false;
+let ws = null;
+let eventCount = 0;
+
+// Term colors
+const termColors = [
+  '#58a6ff', '#3fb950', '#d29922', '#f85149', '#bc8cff',
+  '#db6d28', '#79c0ff', '#56d364', '#e3b341', '#ff7b72'
+];
+function termColor(term) {
+  return termColors[(term - 1) % termColors.length] || '#8b949e';
+}
+
+// Role colors
+const roleColors = {
+  Leader: '#3fb950',
+  Follower: '#58a6ff',
+  Candidate: '#d29922',
+  Dead: '#484f58'
+};
+
+// --- WebSocket ---
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => {
+    document.getElementById('statusDot').classList.add('connected');
+    document.getElementById('statusText').textContent = 'Connected';
+    loadSnapshot();
+  };
+  ws.onclose = () => {
+    document.getElementById('statusDot').classList.remove('connected');
+    document.getElementById('statusText').textContent = 'Disconnected';
+    setTimeout(connectWS, 2000);
+  };
+  ws.onmessage = (msg) => {
+    const e = JSON.parse(msg.data);
+    if (slowMode) {
+      setTimeout(() => handleEvent(e), 400);
+    } else {
+      handleEvent(e);
+    }
+  };
+}
+
+function handleEvent(e) {
+  const type = e.type || '';
+  if (!type.startsWith('raft_')) return;
+
+  // Update node state from event.
+  const nodeId = e.nodeId;
+  if (nodeId && state[nodeId]) {
+    const s = state[nodeId];
+    s.role = e.role || s.role;
+    s.term = e.term ?? s.term;
+    s.commitIndex = e.commitIndex ?? s.commitIndex;
+    s.lastApplied = e.lastApplied ?? s.lastApplied;
+    s.lastLogIndex = e.lastLogIndex ?? s.lastLogIndex;
+    s.leaderId = e.leaderId ?? s.leaderId;
+    s.votedFor = e.votedFor ?? s.votedFor;
+    if (e.peers && e.peers.length > 0) {
+      s.peers = e.peers;
+    }
+    s.alive = s.role !== 'Dead';
+  }
+
+  // Log event.
+  addEventLog(e);
+
+  // Re-render.
+  renderNodes();
+  renderRaftLog();
+  renderReplication();
+}
+
+function addEventLog(e) {
+  const list = document.getElementById('eventList');
+  const line = document.createElement('div');
+  line.className = 'event-line';
+  const now = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const nodeColor = roleColors[state[e.nodeId]?.role] || '#8b949e';
+
+  let detail = '';
+  if (e.peerId) detail += `peer=${e.peerId} `;
+  if (e.type === 'raft_commit_advance') detail += `ci=${e.commitIndex}`;
+  if (e.type === 'raft_role_change') detail += `→ ${e.role}`;
+  if (e.type === 'raft_term_change') detail += `term=${e.term}`;
+  if (e.type === 'raft_log_append') detail += `idx=${e.lastLogIndex}`;
+
+  const typeName = (e.type || '').replace('raft_', '').replace(/_/g, ' ');
+
+  line.innerHTML = `
+    <span class="event-time">${now}</span>
+    <span class="event-node" style="color:${nodeColor}">${e.nodeId}</span>
+    <span class="event-type">${typeName}</span>
+    <span class="event-detail">${detail}</span>
+  `;
+  list.prepend(line);
+  eventCount++;
+  // Keep at most 200 events.
+  while (list.children.length > 200) {
+    list.removeChild(list.lastChild);
+  }
+}
+
+// --- Snapshot load ---
+async function loadSnapshot() {
+  try {
+    const resp = await fetch('/api/cluster/snapshot');
+    const data = await resp.json();
+    data.forEach((ns, i) => {
+      const id = nodeIds[i];
+      state[id] = {
+        role: ns.raft.role || 'Follower',
+        term: ns.raft.term || 0,
+        commitIndex: ns.raft.commitIndex || 0,
+        lastApplied: ns.raft.lastApplied || 0,
+        lastLogIndex: ns.raft.logEntries ? ns.raft.logEntries.length : 0,
+        leaderId: ns.raft.leaderId || '',
+        votedFor: ns.raft.votedFor || '',
+        peers: ns.raft.peers || [],
+        alive: ns.alive
+      };
+      // If this node is the leader, grab the log entries.
+      if (ns.raft.role === 'Leader' && ns.raft.logEntries) {
+        leaderLogEntries = ns.raft.logEntries;
+      }
+    });
+    renderNodes();
+    renderRaftLog();
+    renderReplication();
+  } catch (err) {
+    console.error('snapshot load failed:', err);
+  }
+}
+
+// --- Rendering ---
+function renderNodes() {
+  const svg = document.getElementById('clusterSvg');
+  const w = svg.clientWidth || 800;
+  const h = 170;
+  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+
+  // Clear.
+  svg.innerHTML = '';
+
+  const cardW = 160, cardH = 110;
+  const spacing = (w - numNodes * cardW) / (numNodes + 1);
+  const numNodes_ = nodeIds.length;
+
+  // Draw connection lines first.
+  const positions = [];
+  nodeIds.forEach((id, i) => {
+    const x = spacing + i * (cardW + spacing);
+    const y = (h - cardH) / 2;
+    positions.push({ x: x + cardW / 2, y: y + cardH / 2 });
+  });
+
+  // Draw lines between all pairs.
+  for (let i = 0; i < positions.length; i++) {
+    for (let j = i + 1; j < positions.length; j++) {
+      const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      line.setAttribute('x1', positions[i].x);
+      line.setAttribute('y1', positions[i].y);
+      line.setAttribute('x2', positions[j].x);
+      line.setAttribute('y2', positions[j].y);
+      line.setAttribute('stroke', '#30363d');
+      line.setAttribute('stroke-width', '2');
+      line.setAttribute('stroke-dasharray', '6,4');
+      svg.appendChild(line);
+    }
+  }
+
+  // Draw node cards.
+  nodeIds.forEach((id, i) => {
+    const s = state[id];
+    const x = spacing + i * (cardW + spacing);
+    const y = (h - cardH) / 2;
+    const color = s.alive ? (roleColors[s.role] || '#8b949e') : roleColors.Dead;
+
+    const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    g.setAttribute('class', 'node-card');
+    g.style.cursor = 'pointer';
+    g.onclick = () => { window.location = '/lsm?node=' + id; };
+
+    // Card background.
+    const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    rect.setAttribute('x', x);
+    rect.setAttribute('y', y);
+    rect.setAttribute('width', cardW);
+    rect.setAttribute('height', cardH);
+    rect.setAttribute('rx', '8');
+    rect.setAttribute('fill', '#161b22');
+    rect.setAttribute('stroke', color);
+    rect.setAttribute('stroke-width', '2');
+    g.appendChild(rect);
+
+    // Glow for leader.
+    if (s.role === 'Leader' && s.alive) {
+      const glow = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      glow.setAttribute('x', x - 2);
+      glow.setAttribute('y', y - 2);
+      glow.setAttribute('width', cardW + 4);
+      glow.setAttribute('height', cardH + 4);
+      glow.setAttribute('rx', '10');
+      glow.setAttribute('fill', 'none');
+      glow.setAttribute('stroke', color);
+      glow.setAttribute('stroke-width', '1');
+      glow.setAttribute('opacity', '0.3');
+      g.insertBefore(glow, rect);
+    }
+
+    // Node ID.
+    const title = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    title.setAttribute('x', x + cardW / 2);
+    title.setAttribute('y', y + 22);
+    title.setAttribute('text-anchor', 'middle');
+    title.setAttribute('fill', '#c9d1d9');
+    title.setAttribute('font-size', '13');
+    title.setAttribute('font-weight', '600');
+    title.setAttribute('font-family', 'inherit');
+    title.textContent = id;
+    g.appendChild(title);
+
+    // Role badge.
+    const roleText = s.alive ? s.role : 'DEAD';
+    const badge = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    badge.setAttribute('x', x + cardW / 2);
+    badge.setAttribute('y', y + 42);
+    badge.setAttribute('text-anchor', 'middle');
+    badge.setAttribute('fill', color);
+    badge.setAttribute('font-size', '12');
+    badge.setAttribute('font-weight', '700');
+    badge.setAttribute('font-family', 'inherit');
+    badge.textContent = roleText;
+    g.appendChild(badge);
+
+    // Term.
+    const termText = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    termText.setAttribute('x', x + cardW / 2);
+    termText.setAttribute('y', y + 62);
+    termText.setAttribute('text-anchor', 'middle');
+    termText.setAttribute('fill', '#8b949e');
+    termText.setAttribute('font-size', '11');
+    termText.setAttribute('font-family', 'inherit');
+    termText.textContent = `Term: ${s.term}`;
+    g.appendChild(termText);
+
+    // Commit index / Last applied.
+    const ciText = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    ciText.setAttribute('x', x + cardW / 2);
+    ciText.setAttribute('y', y + 78);
+    ciText.setAttribute('text-anchor', 'middle');
+    ciText.setAttribute('fill', '#8b949e');
+    ciText.setAttribute('font-size', '11');
+    ciText.setAttribute('font-family', 'inherit');
+    ciText.textContent = `CI: ${s.commitIndex}  LA: ${s.lastApplied}`;
+    g.appendChild(ciText);
+
+    // Log length.
+    const logText = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    logText.setAttribute('x', x + cardW / 2);
+    logText.setAttribute('y', y + 94);
+    logText.setAttribute('text-anchor', 'middle');
+    logText.setAttribute('fill', '#8b949e');
+    logText.setAttribute('font-size', '11');
+    logText.setAttribute('font-family', 'inherit');
+    logText.textContent = `Log: ${s.lastLogIndex}`;
+    g.appendChild(logText);
+
+    // "click to open LSM" hint.
+    const hint = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    hint.setAttribute('x', x + cardW / 2);
+    hint.setAttribute('y', y + cardH + 14);
+    hint.setAttribute('text-anchor', 'middle');
+    hint.setAttribute('fill', '#484f58');
+    hint.setAttribute('font-size', '9');
+    hint.setAttribute('font-family', 'inherit');
+    hint.textContent = 'click for LSM view';
+    g.appendChild(hint);
+
+    svg.appendChild(g);
+  });
+}
+
+function renderRaftLog() {
+  const strip = document.getElementById('logStrip');
+  strip.innerHTML = '';
+
+  // Find the leader and use their snapshot for log entries.
+  let leaderId = null;
+  let leaderState = null;
+  for (const id of nodeIds) {
+    if (state[id].role === 'Leader' && state[id].alive) {
+      leaderId = id;
+      leaderState = state[id];
+      break;
+    }
+  }
+
+  if (!leaderId) {
+    strip.innerHTML = '<span style="color:var(--text-dim);font-size:11px">No leader elected</span>';
+    return;
+  }
+
+  const ci = leaderState.commitIndex;
+  const logLen = leaderState.lastLogIndex;
+
+  for (let idx = 1; idx <= logLen; idx++) {
+    const el = document.createElement('div');
+    el.className = 'log-entry ' + (idx <= ci ? 'committed' : 'uncommitted');
+    // Use a cycling term color (estimate term from log entries if available).
+    const entry = leaderLogEntries[idx - 1];
+    const term = entry ? entry.term : leaderState.term;
+    el.style.background = termColor(term);
+    el.textContent = idx;
+    el.title = `Index ${idx}, Term ${term}${idx <= ci ? ' (committed)' : ' (uncommitted)'}`;
+    strip.appendChild(el);
+  }
+}
+
+function renderReplication() {
+  const container = document.getElementById('replBars');
+  container.innerHTML = '';
+
+  // Find leader.
+  let leaderId = null;
+  let leaderState = null;
+  for (const id of nodeIds) {
+    if (state[id].role === 'Leader' && state[id].alive) {
+      leaderId = id;
+      leaderState = state[id];
+      break;
+    }
+  }
+
+  if (!leaderId || !leaderState.peers) return;
+
+  const logLen = leaderState.lastLogIndex || 1;
+
+  leaderState.peers.forEach(p => {
+    const row = document.createElement('div');
+    row.className = 'repl-row';
+
+    const peerAlive = state[p.peerId]?.alive;
+    const peerColor = peerAlive ? 'var(--accent)' : 'var(--text-dim)';
+    const pct = logLen > 0 ? Math.round((p.matchIndex / logLen) * 100) : 0;
+
+    row.innerHTML = `
+      <span class="repl-label" style="color:${peerColor}">${p.peerId}</span>
+      <div class="repl-bar-bg">
+        <div class="repl-bar-fill" style="width:${pct}%;background:${peerColor}"></div>
+      </div>
+      <span class="repl-text">${p.matchIndex}/${logLen}</span>
+    `;
+    container.appendChild(row);
+  });
+}
+
+// --- API calls ---
+async function clusterPut() {
+  const key = document.getElementById('keyInput').value;
+  const value = document.getElementById('valueInput').value;
+  if (!key) return;
+  try {
+    const resp = await fetch('/api/cluster/put', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key, value })
+    });
+    const data = await resp.json();
+    showResult(resp.ok ? `Put OK via ${data.leader}` : data.error || 'Put failed');
+    loadSnapshot();
+  } catch (err) {
+    showResult('Put error: ' + err.message);
+  }
+}
+
+async function clusterDelete() {
+  const key = document.getElementById('keyInput').value;
+  if (!key) return;
+  try {
+    const resp = await fetch('/api/cluster/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key })
+    });
+    const data = await resp.json();
+    showResult(resp.ok ? `Delete OK via ${data.leader}` : data.error || 'Delete failed');
+    loadSnapshot();
+  } catch (err) {
+    showResult('Delete error: ' + err.message);
+  }
+}
+
+async function clusterGet() {
+  const key = document.getElementById('keyInput').value;
+  if (!key) return;
+  try {
+    const resp = await fetch('/api/cluster/get', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key })
+    });
+    const data = await resp.json();
+    if (data.found) {
+      showResult(`GET ${data.key} = "${data.value}" (from ${data.nodeId})`);
+    } else {
+      showResult(`GET ${data.key}: not found (from ${data.nodeId})`);
+    }
+  } catch (err) {
+    showResult('Get error: ' + err.message);
+  }
+}
+
+async function clusterBulk() {
+  try {
+    const resp = await fetch('/api/cluster/bulk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ count: 10 })
+    });
+    const data = await resp.json();
+    showResult(resp.ok ? `Inserted ${data.inserted} keys via ${data.leader}` : data.error || 'Bulk failed');
+    loadSnapshot();
+  } catch (err) {
+    showResult('Bulk error: ' + err.message);
+  }
+}
+
+async function stopNode() {
+  const sel = document.getElementById('stopSelect');
+  const nodeId = sel.value;
+  if (!nodeId) return;
+  try {
+    const resp = await fetch('/api/cluster/stop-node', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nodeId })
+    });
+    const data = await resp.json();
+    if (resp.ok) {
+      state[nodeId].alive = false;
+      state[nodeId].role = 'Dead';
+      showResult(`Stopped ${nodeId}`);
+      renderNodes();
+    } else {
+      showResult(data.error || 'Stop failed');
+    }
+  } catch (err) {
+    showResult('Stop error: ' + err.message);
+  }
+  sel.value = '';
+}
+
+async function startNode() {
+  const sel = document.getElementById('startSelect');
+  const nodeId = sel.value;
+  if (!nodeId) return;
+  try {
+    const resp = await fetch('/api/cluster/start-node', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nodeId })
+    });
+    const data = await resp.json();
+    if (resp.ok) {
+      state[nodeId].alive = true;
+      state[nodeId].role = 'Follower';
+      showResult(`Started ${nodeId}`);
+      renderNodes();
+      loadSnapshot();
+    } else {
+      showResult(data.error || 'Start failed');
+    }
+  } catch (err) {
+    showResult('Start error: ' + err.message);
+  }
+  sel.value = '';
+}
+
+function showResult(msg) {
+  const el = document.getElementById('resultText');
+  el.textContent = msg;
+  setTimeout(() => { if (el.textContent === msg) el.textContent = ''; }, 5000);
+}
+
+function toggleSlowMode() {
+  slowMode = !slowMode;
+  document.getElementById('slowModeBtn').classList.toggle('active', slowMode);
+}
+
+// Periodically refresh snapshot to keep log entries in sync.
+setInterval(() => loadSnapshot(), 5000);
+
+// --- Init ---
+const numNodes = 3;
+
+connectWS();
+renderNodes();
+</script>
+</body>
+</html>

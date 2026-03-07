@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: lsm-tree-visualizer
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/snapshot
